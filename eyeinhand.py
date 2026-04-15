@@ -81,6 +81,8 @@ class EyeInHandCalibrator:
         # SDK 호출 방식 캐싱
         self._tcp_flag_mode = None
         self._joint_flag_mode = None
+        self._last_detection_method = "none"
+        self._last_reprojection_error_px = None
 
         print("=" * 60)
         print("Eye-in-Hand Calibrator 초기화 완료")
@@ -172,12 +174,31 @@ class EyeInHandCalibrator:
     # ------------------------------------------------------------------
     # ChArUco 검출
     # ------------------------------------------------------------------
+    def _compute_reprojection_error(self, obj_points, img_points, rvec, tvec,
+                                    camera_matrix, dist_coeffs) -> Optional[float]:
+        """solvePnP 결과의 평균 재투영 오차(px)를 계산."""
+        try:
+            obj = np.asarray(obj_points, dtype=np.float32).reshape(-1, 1, 3)
+            img = np.asarray(img_points, dtype=np.float32).reshape(-1, 1, 2)
+            projected, _ = cv2.projectPoints(
+                obj, rvec, tvec, camera_matrix, dist_coeffs
+            )
+            err = np.linalg.norm(
+                projected.reshape(-1, 2) - img.reshape(-1, 2), axis=1
+            )
+            return float(err.mean())
+        except Exception:
+            return None
+
     def detect_charuco_pose(self, image: np.ndarray,
                             camera_matrix: np.ndarray,
                             dist_coeffs: np.ndarray
                             ) -> Optional[Tuple[np.ndarray, np.ndarray,
                                                 np.ndarray, np.ndarray]]:
         """이미지에서 ChArUco 보드의 카메라 기준 포즈(target2cam)를 검출."""
+        self._last_detection_method = "none"
+        self._last_reprojection_error_px = None
+
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         gray_enhanced = clahe.apply(gray)
@@ -200,6 +221,11 @@ class EyeInHandCalibrator:
                     flags=cv2.SOLVEPNP_ITERATIVE
                 )
                 if success:
+                    self._last_detection_method = "charuco"
+                    self._last_reprojection_error_px = self._compute_reprojection_error(
+                        obj_points, img_points, rvec, tvec,
+                        camera_matrix, dist_coeffs
+                    )
                     return rvec, tvec, charuco_corners, charuco_ids
 
         # ArUco fallback
@@ -245,6 +271,11 @@ class EyeInHandCalibrator:
                     flags=cv2.SOLVEPNP_ITERATIVE
                 )
                 if ret:
+                    self._last_detection_method = "aruco_fallback"
+                    self._last_reprojection_error_px = self._compute_reprojection_error(
+                        marker_points_3d, marker_points_2d, rvec, tvec,
+                        camera_matrix, dist_coeffs
+                    )
                     charuco_corners_from_markers = np.array(
                         [np.mean(corners[i][0], axis=0) for i in range(len(ids))],
                         dtype=np.float32
@@ -361,11 +392,13 @@ class EyeInHandCalibrator:
             [0.0, color_intrinsics.fy, color_intrinsics.ppy],
             [0.0, 0.0, 1.0]
         ], dtype=np.float64)
-        dist_coeffs = np.zeros(5, dtype=np.float64)
+        dist_coeffs = np.array(color_intrinsics.coeffs, dtype=np.float64)
 
         print(f"  - 해상도: {color_intrinsics.width}x{color_intrinsics.height}")
         print(f"  - fx={color_intrinsics.fx:.2f}, fy={color_intrinsics.fy:.2f}")
         print(f"  - cx={color_intrinsics.ppx:.2f}, cy={color_intrinsics.ppy:.2f}\n")
+        print(f"  - 왜곡 모델: {color_intrinsics.model}")
+        print(f"  - 왜곡 계수: {color_intrinsics.coeffs}\n")
 
         collected = 0
         pose_index = 0
@@ -399,6 +432,8 @@ class EyeInHandCalibrator:
                 charuco_detected = False
                 quality_score = 0.0
                 distance = 0.0
+                detection_method = "none"
+                reprojection_error_px = None
                 charuco_result = self.detect_charuco_pose(
                     color_image, camera_matrix, dist_coeffs)
 
@@ -406,8 +441,12 @@ class EyeInHandCalibrator:
                     rvec, tvec, charuco_corners, charuco_ids = charuco_result
                     charuco_detected = True
                     distance = float(np.linalg.norm(tvec))
+                    detection_method = self._last_detection_method
+                    reprojection_error_px = self._last_reprojection_error_px
 
-                    if charuco_corners is not None and charuco_ids is not None:
+                    if (detection_method == "charuco"
+                            and charuco_corners is not None
+                            and charuco_ids is not None):
                         is_good, _, quality_score = self.evaluate_charuco_quality(
                             charuco_corners, charuco_ids, rvec, tvec)
                         if is_good:
@@ -426,35 +465,49 @@ class EyeInHandCalibrator:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
                 if charuco_detected:
+                    detect_label = ("CHARUCO"
+                                    if detection_method == "charuco"
+                                    else "ARUCO_FALLBACK")
+                    detect_color = ((0, 255, 0)
+                                    if detection_method == "charuco"
+                                    else (0, 165, 255))
                     cv2.putText(vis_image,
-                                f"ChArUco: DETECTED ({distance*1000:.0f}mm)",
-                                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                                f"{detect_label} ({distance*1000:.0f}mm)",
+                                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                detect_color, 2)
                 else:
-                    cv2.putText(vis_image, "ChArUco: NOT DETECTED", (10, 60),
+                    cv2.putText(vis_image, "Board: NOT DETECTED", (10, 60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
                 q_color = ((0, 255, 0) if quality_score >= self.min_detection_confidence
                            else (0, 0, 255))
                 cv2.putText(vis_image, f"Quality: {quality_score:.2f}", (10, 90),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, q_color, 2)
+                if reprojection_error_px is not None:
+                    cv2.putText(vis_image, f"Reproj: {reprojection_error_px:.2f}px",
+                                (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                (255, 255, 0), 1)
 
                 # J4/J5/J6 강조 표시 (이게 중요!)
                 cv2.putText(vis_image,
                             f"J1-J3: [{angles[0]:.1f},{angles[1]:.1f},{angles[2]:.1f}]",
-                            (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+                            (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
                 cv2.putText(vis_image,
                             f"J4={angles[3]:+6.1f}  J5={angles[4]:+6.1f}  J6={angles[5]:+6.1f}",
-                            (10, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+                            (10, 165), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
                 cv2.putText(vis_image,
                             f"TCP: [{coords[0]:.1f},{coords[1]:.1f},{coords[2]:.1f}]",
-                            (10, 170), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+                            (10, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
-                if charuco_detected:
+                if charuco_detected and detection_method == "charuco":
                     cv2.putText(vis_image, "Press 's' to save, 'q' to quit",
                                 (10, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 else:
-                    cv2.putText(vis_image, "No board - cannot save",
-                                (10, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                    reason = ("Need real ChArUco corners"
+                              if charuco_detected else "No board - cannot save")
+                    cv2.putText(vis_image, reason,
+                                (10, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                (0, 0, 255), 2)
 
                 cv2.imshow('Eye-in-Hand Calibration', vis_image)
                 key = cv2.waitKey(1) & 0xFF
@@ -487,6 +540,13 @@ class EyeInHandCalibrator:
                         continue
 
                     rvec, tvec, charuco_corners, charuco_ids = charuco_result
+                    detection_method = self._last_detection_method
+                    reprojection_error_px = self._last_reprojection_error_px
+                    if detection_method != "charuco":
+                        print(f"❌ 저장 실패: ChArUco 코너 기반 검출이 아님 ({detection_method})")
+                        self.robot.DragTeachSwitch(1)
+                        continue
+
                     corner_count = (len(charuco_corners)
                                     if charuco_corners is not None else 0)
                     if corner_count < 6:
@@ -587,15 +647,19 @@ class EyeInHandCalibrator:
                             "charuco_corners_count": int(corner_count),
                             "distance_mm": float(distance * 1000),
                             "quality_score": float(quality_score),
-                            "detection_method":
-                                "charuco" if charuco_corners is not None else "aruco_fallback",
+                            "detection_method": detection_method,
+                            "reprojection_error_px": reprojection_error_px,
                             "color_image_path": str(color_path),
                             "depth_image_path": str(depth_path) if depth_path else None,
                             "intrinsics_path": str(intrinsics_path)
                         }, f, indent=2)
 
+                    reproj_text = (f"{reprojection_error_px:.2f}px"
+                                   if reprojection_error_px is not None
+                                   else "n/a")
                     print(f"✅ 포즈 {pose_index} 저장 완료 "
                           f"(거리 {distance*1000:.0f}mm, 품질 {quality_score:.2f}, "
+                          f"reproj {reproj_text}, "
                           f"J4={angles[3]:.1f} J5={angles[4]:.1f} J6={angles[5]:.1f})")
 
                     collected += 1
@@ -656,6 +720,16 @@ class EyeInHandCalibrator:
             with open(pose_file, 'r') as f:
                 pdata = json.load(f)
 
+            detection_method = cdata.get("detection_method", "unknown")
+            if detection_method != "charuco":
+                print(f"  포즈 {idx:02d}: 검출 방식 {detection_method}, 제외")
+                continue
+
+            corner_count = cdata.get("charuco_corners_count", 0)
+            if corner_count < self.min_charuco_corners:
+                print(f"  포즈 {idx:02d}: 코너 {corner_count}개 < {self.min_charuco_corners}개, 제외")
+                continue
+
             dist_mm = cdata.get("distance_mm", 0)
             if dist_mm > self.far_pose_filter_mm:
                 print(f"  포즈 {idx:02d}: 거리 {dist_mm:.0f}mm > "
@@ -673,6 +747,7 @@ class EyeInHandCalibrator:
                 "coords": pdata["coords"],
                 "quality": cdata.get("quality_score", 0.5),
                 "dist_mm": dist_mm,
+                "reproj_error_px": cdata.get("reprojection_error_px"),
             })
 
         n = len(pose_data)

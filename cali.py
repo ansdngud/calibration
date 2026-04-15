@@ -76,6 +76,8 @@ class EyeToHandCalibrator:
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.poses_dir.mkdir(parents=True, exist_ok=True)
         self.angles_dir.mkdir(parents=True, exist_ok=True)
+        self._last_detection_method = "none"
+        self._last_reprojection_error_px = None
         
         print(f"Eye-to-Hand Calibrator 초기화 완료")
         print(f"ChArUco 크기: {charuco_squares_x}x{charuco_squares_y}")
@@ -91,12 +93,33 @@ class EyeToHandCalibrator:
         print(f"  - 카메라 -X축 → 로봇 Y축")
         print(f"  - 카메라 -Y축 → 로봇 Z축")
     
+    def _compute_reprojection_error(self, obj_points: np.ndarray, img_points: np.ndarray,
+                                    rvec: np.ndarray, tvec: np.ndarray,
+                                    camera_matrix: np.ndarray,
+                                    dist_coeffs: np.ndarray) -> Optional[float]:
+        """solvePnP 결과의 평균 재투영 오차(px)를 계산."""
+        try:
+            obj = np.asarray(obj_points, dtype=np.float32).reshape(-1, 1, 3)
+            img = np.asarray(img_points, dtype=np.float32).reshape(-1, 1, 2)
+            projected, _ = cv2.projectPoints(
+                obj, rvec, tvec, camera_matrix, dist_coeffs
+            )
+            err = np.linalg.norm(
+                projected.reshape(-1, 2) - img.reshape(-1, 2), axis=1
+            )
+            return float(err.mean())
+        except Exception:
+            return None
+
 
     def detect_charuco_pose(self, image: np.ndarray, camera_matrix: np.ndarray, dist_coeffs: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
         """
         이미지에서 ChArUco 보드의 포즈를 검출합니다.
         cv_test.ipynb의 코드를 참고하여 OpenCV 4.11.0에 맞게 개선된 버전
         """
+        self._last_detection_method = "none"
+        self._last_reprojection_error_px = None
+
         # 1. 이미지 전처리 (CLAHE로 대비 향상)
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
@@ -133,6 +156,11 @@ class EyeToHandCalibrator:
                 )
                 
                 if success:
+                    self._last_detection_method = "charuco"
+                    self._last_reprojection_error_px = self._compute_reprojection_error(
+                        objPoints, imgPoints, rvec, tvec,
+                        camera_matrix, dist_coeffs
+                    )
                     print(f"\rDEBUG: ChArUco pose estimation successful with {len(objPoints)} points", end="")
                     return rvec, tvec, charuco_corners, charuco_ids
                 else:
@@ -218,6 +246,11 @@ class EyeToHandCalibrator:
                 )
                 
                 if ret:
+                    self._last_detection_method = "aruco_fallback"
+                    self._last_reprojection_error_px = self._compute_reprojection_error(
+                        marker_points_3d, marker_points_2d, rvec, tvec,
+                        camera_matrix, dist_coeffs
+                    )
                     print(f"\rDEBUG: ArUco marker-based pose estimation successful with {len(ids)} markers", end="")
                     
                     # ArUco 마커 기반 결과를 charuco_corners 형태로 변환
@@ -492,6 +525,8 @@ class EyeToHandCalibrator:
                 quality_score = 0.0
                 charuco_result = None  # 초기화 추가
                 distance = 0.0  # 초기화 추가
+                detection_method = "none"
+                reprojection_error_px = None
                 
                 try:
                     # 이미지 전처리로 마커 검출 정확도 향상
@@ -547,10 +582,14 @@ class EyeToHandCalibrator:
                         rvec, tvec, charuco_corners, charuco_ids = charuco_result
                         charuco_detected = True
                         distance = np.linalg.norm(tvec)
+                        detection_method = self._last_detection_method
+                        reprojection_error_px = self._last_reprojection_error_px
                         detection_info = f"검출됨 (거리: {distance*1000:.1f}mm)"
                         
                         # 품질 평가
-                        if charuco_corners is not None and charuco_ids is not None:
+                        if (detection_method == "charuco"
+                                and charuco_corners is not None
+                                and charuco_ids is not None):
                             print(f"\rDEBUG: ChArUco corners={len(charuco_corners)}, ids={len(charuco_ids)}, min_required={self.min_charuco_corners}", end="")
                             
                             is_good_quality, quality_message, quality_score = self.evaluate_charuco_quality(
@@ -565,32 +604,10 @@ class EyeToHandCalibrator:
                             if is_good_quality:
                                 cv2.drawFrameAxes(gray_enhanced_colored, camera_matrix, dist_coeffs, rvec, tvec, 0.05)
                         else:
-                            # ArUco 마커만 검출된 경우에도 품질 평가 시도
-                            print(f"\rDEBUG: ArUco markers only, trying alternative quality assessment", end="")
-                            
-                            # ArUco 마커 개수를 기반으로 정교한 품질 평가
-                            if hasattr(self, '_last_marker_count'):
-                                marker_count = self._last_marker_count
-                                if marker_count >= 15:  # 충분한 ArUco 마커가 검출된 경우
-                                    quality_score = 0.5  # 더 높은 점수
-                                    is_good_quality = quality_score >= self.min_detection_confidence
-                                    quality_info = f"Quality: {quality_score:.2f} (ArUco: {marker_count}) ({'GOOD' if is_good_quality else 'LOW'})"
-                                    print(f"\rArUco: {marker_count} markers, Quality: {quality_score:.2f}", end="")
-                                elif marker_count >= 10:  # 중간 수준의 ArUco 마커
-                                    quality_score = 0.3
-                                    is_good_quality = quality_score >= self.min_detection_confidence
-                                    quality_info = f"Quality: {quality_score:.2f} (ArUco: {marker_count}) ({'GOOD' if is_good_quality else 'LOW'})"
-                                    print(f"\rArUco: {marker_count} markers, Quality: {quality_score:.2f}", end="")
-                                else:
-                                    quality_score = 0.1
-                                    is_good_quality = False
-                                    quality_info = f"Quality: {quality_score:.2f} (ArUco: {marker_count}) (LOW)"
-                                    print(f"\rArUco: {marker_count} markers (insufficient)", end="")
-                            else:
-                                quality_score = 0.0
-                                is_good_quality = False
-                                quality_info = "Quality: N/A (ArUco only)"
-                                print(f"\rChArUco: ArUco markers only", end="")
+                            quality_score = 0.0
+                            is_good_quality = False
+                            quality_info = f"Quality: {quality_score:.2f} ({detection_method})"
+                            print(f"\rDEBUG: Rejecting non-ChArUco detection for calibration ({detection_method})", end="")
                         
                 except Exception as e:
                     detection_info = f"검출 오류: {str(e)[:20]}"
@@ -633,8 +650,14 @@ class EyeToHandCalibrator:
                 
                 # ChArUco 검출 상태 표시
                 if charuco_detected:
-                    cv2.putText(info_image, f"ChArUco: DETECTED ({distance*1000:.1f}mm)", (10, 60), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    detect_label = ("CHARUCO"
+                                    if detection_method == "charuco"
+                                    else "ARUCO_FALLBACK")
+                    detect_color = ((0, 255, 0)
+                                    if detection_method == "charuco"
+                                    else (0, 165, 255))
+                    cv2.putText(info_image, f"{detect_label} ({distance*1000:.1f}mm)", (10, 60), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, detect_color, 2)
                 else:
                     cv2.putText(info_image, "ChArUco: NOT DETECTED", (10, 60), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
@@ -644,6 +667,9 @@ class EyeToHandCalibrator:
                     quality_color = (0, 255, 0) if quality_score >= self.min_detection_confidence else (0, 0, 255)
                     cv2.putText(info_image, f"Quality: {quality_score:.2f} ({'GOOD' if quality_score >= self.min_detection_confidence else 'LOW'})", (10, 110), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, quality_color, 1)
+                if reprojection_error_px is not None:
+                    cv2.putText(info_image, f"Reproj: {reprojection_error_px:.2f}px", (10, 125), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1)
                 
                 cv2.putText(info_image, f"Angles: [{angles[0]:.1f}, {angles[1]:.1f}, {angles[2]:.1f}]", (10, 135),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
@@ -653,7 +679,7 @@ class EyeToHandCalibrator:
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                 
                 # 저장 가능 여부 표시
-                if charuco_detected:
+                if charuco_detected and detection_method == "charuco":
                     corner_count = len(charuco_corners) if charuco_corners is not None else 0
                     if corner_count >= 6:
                         cv2.putText(info_image, "Press 's' to save", (10, 250), 
@@ -662,7 +688,9 @@ class EyeToHandCalibrator:
                         cv2.putText(info_image, f"Need >=6 corners (current: {corner_count})", (10, 250), 
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
                 else:
-                    cv2.putText(info_image, "No ChArUco detected - cannot save", (10, 250), 
+                    message = ("Need real ChArUco corners"
+                               if charuco_detected else "No ChArUco detected - cannot save")
+                    cv2.putText(info_image, message, (10, 250), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
                 
                 # 화면 표시
@@ -683,12 +711,21 @@ class EyeToHandCalibrator:
                     # 안정화 후 다시 카메라 프레임과 ChArUco 검출
                     frames = pipeline.wait_for_frames()
                     color_frame = frames.get_color_frame()
+                    depth_frame = frames.get_depth_frame()
                     if color_frame:
                         color_image = np.asanyarray(color_frame.get_data())
+                        depth_image = np.asanyarray(depth_frame.get_data()) if depth_frame else None
                         charuco_result = self.detect_charuco_pose(color_image, camera_matrix, dist_coeffs)
                         
                         if charuco_result is not None:
                             rvec, tvec, charuco_corners, charuco_ids = charuco_result
+                            detection_method = self._last_detection_method
+                            reprojection_error_px = self._last_reprojection_error_px
+                            if detection_method != "charuco":
+                                print(f"\n⚠️ 저장 건너뜀: 검출 방식 {detection_method}")
+                                self.robot.DragTeachSwitch(1)
+                                continue
+
                             distance = np.linalg.norm(tvec)
                             
                             # 최소 코너 개수 체크 (6개 이상 필요)
@@ -700,15 +737,10 @@ class EyeToHandCalibrator:
                                 self.robot.DragTeachSwitch(1)
                                 continue
                             
-                            # 품질 평가
-                            if charuco_corners is not None and charuco_ids is not None:
-                                is_good_quality, quality_message, quality_score = self.evaluate_charuco_quality(
-                                    charuco_corners, charuco_ids, rvec, tvec
-                                )
-                            else:
-                                # ArUco 마커 기반 fallback 결과인 경우
-                                is_good_quality = True  # ArUco 마커 기반은 기본적으로 양호로 간주
-                                quality_score = 0.5
+                            # 품질 평가는 실제 ChArUco 코너 검출 프레임에만 적용
+                            is_good_quality, quality_message, quality_score = self.evaluate_charuco_quality(
+                                charuco_corners, charuco_ids, rvec, tvec
+                            )
                             
                             if is_good_quality:
                                 # 현재 로봇 상태 가져오기
@@ -786,27 +818,25 @@ class EyeToHandCalibrator:
                                 with open(intrinsics_path, 'w') as f:
                                     json.dump(intrinsics_data, f, indent=2)
                                 
-                                # ChArUco 데이터 저장 (타겟 -> 카메라) - Eye-to-Hand 구조
-                                # detect_charuco_pose()는 카메라 -> 타겟을 반환하므로 역행렬을 취함
-                                R_cam2target, _ = cv2.Rodrigues(rvec)
-                                t_cam2target = tvec
-                                
-                                # 타겟 -> 카메라 변환 (역행렬)
-                                R_target2cam = R_cam2target.T
-                                t_target2cam = -R_target2cam @ t_cam2target
+                                # solvePnP는 타겟 -> 카메라 변환을 직접 반환한다.
+                                R_target2cam, _ = cv2.Rodrigues(rvec)
+                                t_target2cam = tvec
+                                R_cam2target = R_target2cam.T
+                                t_cam2target = -R_cam2target @ t_target2cam
                                 
                                 charuco_data = {
-                                    "rvec_target2cam": cv2.Rodrigues(R_target2cam)[0].tolist(),
+                                    "rvec_target2cam": rvec.tolist(),
                                     "tvec_target2cam": t_target2cam.tolist(),
-                                    "rvec_cam2target": rvec.tolist(),  # 원본 데이터도 보존
-                                    "tvec_cam2target": tvec.tolist(),
+                                    "rvec_cam2target": cv2.Rodrigues(R_cam2target)[0].tolist(),
+                                    "tvec_cam2target": t_cam2target.tolist(),
                                     "pose_index": pose_index,
                                     "timestamp": timestamp,
                                     "charuco_corners_count": len(charuco_corners) if charuco_corners is not None else 0,
                                     "charuco_ids_count": len(charuco_ids) if charuco_ids is not None else 0,
                                     "distance_mm": float(distance * 1000),
                                     "quality_score": float(quality_score),
-                                    "detection_method": "charuco_corners" if charuco_corners is not None else "aruco_markers",
+                                    "detection_method": detection_method,
+                                    "reprojection_error_px": reprojection_error_px,
                                     "color_image_path": str(color_path),
                                     "depth_image_path": str(depth_path) if depth_image is not None else None,
                                     "intrinsics_path": str(intrinsics_path)
@@ -818,7 +848,9 @@ class EyeToHandCalibrator:
                                 print(f"\n✅ 포즈 {pose_index} 저장 완료!")
                                 print(f"  - 거리: {distance*1000:.1f}mm")
                                 print(f"  - 품질: {quality_score:.2f}")
-                                print(f"  - 검출 방법: {'ChArUco 코너' if charuco_corners is not None else 'ArUco 마커'}")
+                                if reprojection_error_px is not None:
+                                    print(f"  - 재투영 오차: {reprojection_error_px:.2f}px")
+                                print(f"  - 검출 방법: {detection_method}")
                                 print(f"  - 각도 데이터: {angle_path}")
                                 print(f"  - 로봇 포즈: {pose_path}")
                                 print(f"  - ChArUco 포즈: {charuco_path}")
@@ -922,6 +954,16 @@ class EyeToHandCalibrator:
                 # ChArUco 포즈 로드 (타겟 -> 카메라) - Eye-to-Hand 구조
                 with open(charuco_file, 'r') as f:
                     charuco_data = json.load(f)
+
+                detection_method = charuco_data.get("detection_method", "unknown")
+                if detection_method not in ("charuco", "charuco_corners"):
+                    print(f"포즈 {i+1}: 검출 방식 {detection_method}, 제외")
+                    continue
+
+                corner_count = charuco_data.get("charuco_corners_count", 0)
+                if corner_count < self.min_charuco_corners:
+                    print(f"포즈 {i+1}: 코너 {corner_count}개 < {self.min_charuco_corners}개, 제외")
+                    continue
                 
                 # 품질 점수를 가중치로 사용
                 quality_score = charuco_data.get("quality_score", 0.5)  # 기본값 0.5
@@ -981,7 +1023,6 @@ class EyeToHandCalibrator:
                 T_base2ee_list.append(T_base2ee)
                 
                 # 디버그 정보
-                detection_method = charuco_data.get("detection_method", "unknown")
                 distance_mm = charuco_data.get("distance_mm", 0)
                 print(f"포즈 {i+1}: {detection_method}, 거리={distance_mm:.1f}mm, 품질={quality_score:.3f}")
             
